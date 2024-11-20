@@ -1,19 +1,25 @@
+import json
 import math
+from typing import Optional, Dict
 
 import actionlib
 import rospy
 from geometry_msgs.msg import WrenchStamped, PoseStamped, PointStamped, PoseWithCovarianceStamped
-from robokudo_msgs.msg import QueryAction, QueryGoal
+#from robokudo_msgs.msg import QueryAction, QueryGoal
+from std_msgs.msg import String
 
-from pycram.designators.action_designator import fts, ParkArmsAction, DetectAction
+from pycram.bullet_world import Object
+from pycram.designators.action_designator import fts, ParkArmsAction, DetectAction, LookAtAction, HeadFollowAction, \
+    NavigateAction
 from pycram.designators.motion_designator import MoveGripperMotion
-from pycram.enums import Arms, ImageEnum
+from pycram.designators.object_designator import  HumanDescription
+from pycram.enums import Arms, ImageEnum, ObjectType
 from pycram.fluent import Fluent
 from pycram.language import Monitor, Code
 from pycram.local_transformer import LocalTransformer
 from pycram.plan_failures import SensorMonitoringCondition
 from pycram.pose import Pose
-from pycram.process_module import real_robot
+from pycram.process_module import real_robot, simulated_robot
 from demos.pycram_hsrb_real_test_demos.utils.startup import startup
 import pycram.external_interfaces.giskard_new as giskardpy
 import pycram.external_interfaces.robokudo as robokudo
@@ -25,13 +31,45 @@ from geometry_msgs.msg import PoseStamped
 from pycram.ros.viz_marker_publisher import ManualMarkerPublisher
 
 # Initialize the necessary components
-world, v, text_to_speech_publisher, image_switch_publisher, move, robot = startup()
-
+world, v, text_to_speech_publisher, image_switch_publisher, move = startup()
+robot = Object("hsrb", ObjectType.ROBOT, "../../resources/hsrb.urdf", pose=Pose([0, 0, 0]))
+pub_nlp = rospy.Publisher('/startListener', String, queue_size=10)
+response = ""
+callback = False
+waiving = False
 giskardpy.init_giskard_interface()
 robokudo.init_robokudo_interface()
 marker = ManualMarkerPublisher()
 listener = tf.TransformListener()
+
+
+class CustomerDescription(HumanDescription):
+    """
+    Class that represents customers, which ar
+    """
+    def __init__(self,pose: Pose,  num: int,orders: Optional = None):
+        super().__init__("", pose)
+        self.orders = orders
+        self.num = num
+    def set_order(self, orders: str):
+        """
+        Sets the order for the unique customer
+        :param orders: The order of the customer
+        """
+        self.orders= orders
+
+    def get_order(self):
+        """
+        Gets the order for the unique customer
+        """
+        return self.orders
+    def get_num(self):
+        return self.num
+
 class Restaurant:
+
+    global customers
+
     def __init__(self):
         self.toya_pose = Fluent()
         self.human_pose = None
@@ -43,7 +81,7 @@ class Restaurant:
         rospy.sleep(0.5)
 
     def distance(self):
-        print("toya pose:" + str(self.toya_pose.get_value().pose))
+        print("toya posget_valuee:" + str(self.toya_pose.get_value().pose))
         if self.human_pose:
             dis = math.sqrt((self.human_pose.pose.position.x - self.toya_pose.get_value().pose.position.x) ** 2 +
                             (self.human_pose.pose.position.y - self.toya_pose.get_value().pose.position.y) ** 2)
@@ -54,6 +92,7 @@ class Restaurant:
 
 
 restaurant = Restaurant()
+customer1 = CustomerDescription(1, "Tea")
 
 
 def transform_pose(input_pose, from_frame, to_frame):
@@ -83,8 +122,47 @@ def monitor_func():
 rospy.loginfo("Waiting for action server")
 rospy.loginfo("You can start your demo now")
 
+def convert_String(input : str) -> Dict:
+    return json.loads(input)
+
+def take_order(num: int, customer: CustomerDescription):
+    global callback
+
+    DetectAction(technique='human').resolve().perform()
+    HeadFollowAction('start').resolve().perform()
+
+    pub_nlp.publish("start listening")
+    rospy.sleep(3)
+    tmp_res = convert_String(response)
+    order_response = tmp_res['Order']
+    amount_response = tmp_res['Amount']
+
+def look_around(increase: float):
+    angle = 0
+    while angle <= 1:
+        LookAtAction([Pose([robot.get_pose().pose.position.x, robot.get_pose().pose.position.y, 0],
+                           [robot.get_pose().orientation.x, robot.get_pose().orientation.y,
+                            robot.get_pose().orientation.z, angle])])
+        rospy.sleep(1)
+        print(robot.get_pose().orientation)
+        angle += increase
+
+
+def data_cb(data):
+    global response
+    global callback
+    global waiving
+
+    image_switch_publisher.pub_now(ImageEnum.HI.value)
+    response = data.data.split(",")
+    response.append("None")
+    callback = True
+
+
 
 def demo(step):
+    look_at_frames = [Pose([restaurant.toya_pose.get_value().pose.position.x, restaurant.toya_pose.get_value().pose.position.y,])]
+    global order
     with real_robot:
         talk = True
 
@@ -96,6 +174,13 @@ def demo(step):
         if step <= 1:
             # todo look from left to right
             # LookAtAction(targets=[look_pose]).resolve().perform()
+            config_left = {'head_pan_joint': -0.5}
+            config_right = {'head_pan_joint': 0.5}
+            print(robot.get_pose().orientation)
+            look_around(0.5)
+
+
+
             image_switch_publisher.pub_now(ImageEnum.WAVING.value)
             success = False
             while not success:
@@ -115,6 +200,7 @@ def demo(step):
                     if human_p:
                         success = True
                         restaurant.human_pose = human_p
+
                         # print(human_p.pose.position.x)
                 except Exception as e:
                     print("An error occurred from perception:", e)
@@ -131,6 +217,17 @@ def demo(step):
             except SensorMonitoringCondition:
                 print("ABBRUCH")
                 move.interrupt()
+        if step <= 3:
+            text_to_speech_publisher.pub_now("Arrived at customer", talk)
+            image_switch_publisher.pub_now(ImageEnum.WAVING.value)
+
+
+        if step <= 4:
+            text_to_speech_publisher.pub_now("What can I get for you", talk)
+            
+
+
+            cust_new = CustomerDescription()
             # robot_pose_to_human = Pose.from_pose_stamped(calc_distance(human_p, 0.5))
 
             # world.current_bullet_world.add_vis_axis(robot_pose_to_human)
